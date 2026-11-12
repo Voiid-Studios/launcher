@@ -9,6 +9,12 @@ import {pipeline} from 'node:stream/promises';
 
 const repository = 'Voiid-Studios/voiid-launcher';
 const versionPattern = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/;
+let publicStage = 'initialization';
+
+export function archiveTool(platform = process.platform, systemRoot = process.env.SystemRoot) {
+  // Git Bash prepends GNU tar to PATH. Its drive-letter handling treats D:\\... as a remote host.
+  return platform === 'win32' ? path.win32.join(systemRoot || 'C:\\Windows', 'System32', 'tar.exe') : 'tar';
+}
 
 export function approveComparison(comparison, sha) {
   return /^[a-f0-9]{40}$/.test(sha) && ['ahead', 'identical'].includes(comparison.status)
@@ -79,6 +85,7 @@ async function main() {
     run(process.execPath, [npmCli, '--prefix', directory, ...args]);
   };
   const command = process.argv[2];
+  publicStage = 'command';
   if (command === 'clean') {
     // Verify the fixed child of RUNNER_TEMP before recursive removal.
     if (path.dirname(root) !== temporary || path.basename(root) !== 'voiid-bridge') throw new Error('Invalid cleanup path.');
@@ -92,6 +99,7 @@ async function main() {
       throw new Error('Required bridge credential is missing.');
     }
   } else if (command === 'download') {
+    publicStage = 'source-authorization';
     const sha = process.env.SOURCE_SHA;
     if (!/^[a-f0-9]{40}$/.test(sha ?? '')) throw new Error('An exact source commit is required.');
     const token = process.env.SOURCE_READ_TOKEN;
@@ -99,19 +107,24 @@ async function main() {
     if (!approveComparison(comparison, sha)) throw new Error('Source commit must belong to approved main history.');
     if (fs.existsSync(source)) throw new Error('Temporary source directory already exists.');
     const archive = path.join(root, 'source.tar.gz');
+    publicStage = 'source-download';
     const response = await api(`tarball/${sha}`, token);
     await pipeline(Readable.fromWeb(response.body), fs.createWriteStream(archive, {flags: 'wx', mode: 0o600}));
     fs.mkdirSync(source, {mode: 0o700});
-    run('tar', ['-xzf', archive, '--strip-components=1', '-C', source], root);
+    publicStage = 'archive-extraction';
+    run(archiveTool(), ['-xzf', archive, '--strip-components=1', '-C', source], root);
     fs.rmSync(archive);
+    publicStage = 'source-version';
     version();
   } else if (command === 'install') {
+    publicStage = 'dependency-installation';
     if (process.arch !== process.env.EXPECTED_ARCH) throw new Error('Runner architecture mismatch.');
     npm(desktop, 'ci', '--no-audit', '--no-fund');
     npm(path.join(source, 'frontend'), 'ci', '--no-audit', '--no-fund');
     run('rustup', ['toolchain', 'install', 'stable', '--profile', 'minimal', '--no-self-update']);
     run('rustup', ['default', 'stable']);
   } else if (command === 'build') {
+    publicStage = 'compilation-and-signing';
     const expected = process.platform === 'win32' ? 'windows-x64' : `macos-${process.arch}`;
     if (process.env.EXPECTED_PLATFORM !== expected) throw new Error('Runner platform mismatch.');
     if (!process.env.UPDATER_PRIVATE_KEY?.trim()) throw new Error('Original updater signing key is required.');
@@ -130,12 +143,14 @@ async function main() {
       fs.rmSync(key + '.pub', {force: true});
     }
   } else if (command === 'export') {
+    publicStage = 'distribution-export';
     const platform = process.env.EXPECTED_PLATFORM;
     const input = path.join(desktop, 'release', ...(platform === 'windows-x64' ? [] : [platform]));
     const destination = path.join(root, 'distribution');
     copyDistribution(input, destination, distributionFiles(version(), platform));
     output(destination);
   } else if (command === 'merge') {
+    publicStage = 'manifest-merge';
     run(process.execPath, [path.join(desktop, 'scripts/merge-release.mjs')]);
     const files = ['windows-x64', 'macos-x64', 'macos-arm64'].flatMap(platform => distributionFiles(version(), platform))
       .filter(name => !name.endsWith('.sig'));
@@ -143,9 +158,11 @@ async function main() {
     copyDistribution(path.join(desktop, 'release-combined'), destination, files);
     output(destination);
   } else if (command === 'publish') {
+    publicStage = 'release-publication';
     version();
     run(process.execPath, [path.join(desktop, 'scripts/publish-ci.mjs')]);
   } else if (command === 'website') {
+    publicStage = 'website-notification';
     await api('actions/workflows/publish-website.yml/dispatches', process.env.CALLBACK_TOKEN,
       {method: 'POST', body: JSON.stringify({ref: 'main'})});
   } else throw new Error('Unknown bridge command.');
@@ -155,7 +172,7 @@ async function main() {
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   try { await main(); } catch {
     // Exceptions can contain source excerpts, private paths or signed archive URLs.
-    console.error('::error::Bridge step failed. Private diagnostics were withheld. Check credentials, approved commit, version and signing configuration.');
+    console.error(`::error::Bridge step failed (${publicStage}). Private diagnostics were withheld. Check credentials, approved commit, version and signing configuration.`);
     process.exitCode = 1;
   }
 }
