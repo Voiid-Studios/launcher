@@ -1,0 +1,161 @@
+name: Build launcher installers
+run-name: Launcher build ${{ inputs.source_sha }}
+on:
+  workflow_dispatch:
+    inputs:
+      source_sha:
+        description: Exact approved source commit (40 hexadecimal characters)
+        required: true
+        type: string
+      publish:
+        description: Publish the release and refresh the download website
+        default: false
+        type: boolean
+      release_tag:
+        description: Optional tag; must match the launcher version
+        default: ''
+        type: string
+permissions:
+  contents: read
+concurrency:
+  group: launcher-release
+  cancel-in-progress: false
+jobs:
+  preflight:
+    if: github.repository == 'Voiid-Studios/launcher' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      SOURCE_SHA: ${{ inputs.source_sha }}
+      RELEASE_TAG: ${{ inputs.release_tag }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: '24'
+          package-manager-cache: false
+      - name: Check credentials before starting platform runners
+        env:
+          SOURCE_READ_TOKEN: ${{ secrets.SOURCE_READ_TOKEN }}
+          UPDATER_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          CALLBACK_TOKEN: ${{ secrets.BRIDGE_CALLBACK_TOKEN }}
+          PUBLISH: ${{ inputs.publish }}
+        run: node .github/scripts/bridge.mjs preflight
+      - name: Validate approved source and release version
+        env:
+          SOURCE_READ_TOKEN: ${{ secrets.SOURCE_READ_TOKEN }}
+        run: node .github/scripts/bridge.mjs download
+      - name: Remove temporary source and logs
+        if: always()
+        run: node .github/scripts/bridge.mjs clean
+  build:
+    needs: preflight
+    if: github.repository == 'Voiid-Studios/launcher' && github.ref == 'refs/heads/main'
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: windows-x64
+            runner: windows-latest
+            arch: x64
+          - platform: macos-x64
+            runner: macos-15-intel
+            arch: x64
+          - platform: macos-arm64
+            runner: macos-15
+            arch: arm64
+    defaults:
+      run:
+        shell: bash
+    env:
+      SOURCE_SHA: ${{ inputs.source_sha }}
+      RELEASE_TAG: ${{ inputs.release_tag }}
+      EXPECTED_PLATFORM: ${{ matrix.platform }}
+      EXPECTED_ARCH: ${{ matrix.arch }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: '24'
+          architecture: ${{ matrix.arch }}
+          package-manager-cache: false
+      - name: Download approved source into temporary storage
+        env:
+          SOURCE_READ_TOKEN: ${{ secrets.SOURCE_READ_TOKEN }}
+        run: node .github/scripts/bridge.mjs download
+      - name: Install dependencies without publishing build output
+        run: node .github/scripts/bridge.mjs install
+      - name: Compile and sign installers privately
+        env:
+          UPDATER_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: node .github/scripts/bridge.mjs build
+      - name: Select only distributable files
+        id: export
+        run: node .github/scripts/bridge.mjs export
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: installers-${{ matrix.platform }}
+          path: ${{ steps.export.outputs.path }}
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 1
+      - name: Remove temporary source, signing material and logs
+        if: always()
+        run: node .github/scripts/bridge.mjs clean
+  release:
+    needs: build
+    if: github.repository == 'Voiid-Studios/launcher' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    env:
+      SOURCE_SHA: ${{ inputs.source_sha }}
+      RELEASE_TAG: ${{ inputs.release_tag }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: '24'
+          package-manager-cache: false
+      - name: Download approved release tooling into temporary storage
+        env:
+          SOURCE_READ_TOKEN: ${{ secrets.SOURCE_READ_TOKEN }}
+        run: node .github/scripts/bridge.mjs download
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          pattern: installers-*
+          path: ${{ runner.temp }}/voiid-bridge/source/desktop/release-parts
+          merge-multiple: true
+      - name: Validate and merge signed manifests
+        id: export
+        run: node .github/scripts/bridge.mjs merge
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: launcher-release
+          path: ${{ steps.export.outputs.path }}
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 1
+      - name: Publish the complete release
+        if: inputs.publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: node .github/scripts/bridge.mjs publish
+      - name: Refresh the download website using its private workflow
+        if: inputs.publish
+        env:
+          CALLBACK_TOKEN: ${{ secrets.BRIDGE_CALLBACK_TOKEN }}
+        run: node .github/scripts/bridge.mjs website
+      - name: Remove temporary source and logs
+        if: always()
+        run: node .github/scripts/bridge.mjs clean
