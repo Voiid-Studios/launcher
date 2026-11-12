@@ -3,7 +3,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 import {spawnSync} from 'node:child_process';
-import {fileURLToPath} from 'node:url';
+import {fileURLToPath, pathToFileURL} from 'node:url';
 import {Readable} from 'node:stream';
 import {pipeline} from 'node:stream/promises';
 
@@ -43,11 +43,12 @@ export function copyDistribution(input, output, files) {
   }
 }
 
-export function quietRun(command, args, {cwd, log, env = process.env} = {}) {
+export function quietRun(command, args, {cwd, log, env = process.env, allowedExitCodes = [0]} = {}) {
   const descriptor = fs.openSync(log, 'a', 0o600);
   try {
     const result = spawnSync(command, args, {cwd, env, stdio: ['ignore', descriptor, descriptor], windowsHide: true});
-    if (result.error || result.status !== 0) throw new Error('Private build step failed. Output was not published.');
+    if (result.error || !allowedExitCodes.includes(result.status)) throw new Error('Private build step failed. Output was not published.');
+    return result.status;
   } finally { fs.closeSync(descriptor); }
 }
 
@@ -95,14 +96,16 @@ async function main() {
   fs.mkdirSync(root, {recursive: true, mode: 0o700});
   if (command === 'preflight') {
     if (!process.env.SOURCE_READ_TOKEN?.trim() || !process.env.UPDATER_PRIVATE_KEY?.trim()
-        || (process.env.PUBLISH === 'true' && !process.env.CALLBACK_TOKEN?.trim())) {
+        || (process.env.PUBLISH === 'true' && (!process.env.APP_ID?.trim() || !process.env.APP_PRIVATE_KEY?.trim()))) {
       throw new Error('Required bridge credential is missing.');
     }
-  } else if (command === 'download') {
+  } else if (command === 'download' || command === 'website-download') {
     publicStage = 'source-authorization';
-    const sha = process.env.SOURCE_SHA;
-    if (!/^[a-f0-9]{40}$/.test(sha ?? '')) throw new Error('An exact source commit is required.');
     const token = process.env.SOURCE_READ_TOKEN;
+    // A standalone website refresh resolves main once; subsequent downloads use that immutable SHA.
+    const sha = command === 'website-download' && !process.env.SOURCE_SHA?.trim()
+      ? (await (await api('commits/main', token)).json()).sha : process.env.SOURCE_SHA;
+    if (!/^[a-f0-9]{40}$/.test(sha ?? '')) throw new Error('An exact source commit is required.');
     const comparison = await (await api(`compare/${sha}...main?per_page=1`, token)).json();
     if (!approveComparison(comparison, sha)) throw new Error('Source commit must belong to approved main history.');
     if (fs.existsSync(source)) throw new Error('Temporary source directory already exists.');
@@ -161,10 +164,35 @@ async function main() {
     publicStage = 'release-publication';
     version();
     run(process.execPath, [path.join(desktop, 'scripts/publish-ci.mjs')]);
-  } else if (command === 'website') {
-    publicStage = 'website-notification';
-    await api('actions/workflows/publish-website.yml/dispatches', process.env.CALLBACK_TOKEN,
-      {method: 'POST', body: JSON.stringify({ref: 'main'})});
+  } else if (command === 'website-key') {
+    publicStage = 'website-app-configuration';
+    const {prepareAppKey} = await import(pathToFileURL(path.join(source, 'website/scripts/prepare-app-key.mjs')).href);
+    // This helper masks the normalized PEM before returning it as a step output.
+    prepareAppKey();
+  } else if (command === 'website-build') {
+    publicStage = 'website-build-and-routing-tests';
+    npm(path.join(source, 'website'), 'run', 'build');
+    npm(path.join(source, 'website'), 'test');
+  } else if (command === 'website-sync') {
+    publicStage = 'website-publication';
+    if (!process.env.GITHUB_WORKSPACE) throw new Error('Missing public workspace.');
+    const workspace = path.resolve(process.env.GITHUB_WORKSPACE);
+    const hub = path.join(workspace, 'pages-hub');
+    // Only reset the dedicated pages-hub checkout, never the private source tree.
+    if (path.dirname(hub) !== workspace || fs.lstatSync(hub).isSymbolicLink()) throw new Error('Invalid hub checkout.');
+    run('git', ['config', 'user.name', 'pages-hub-writer[bot]'], hub);
+    run('git', ['config', 'user.email', 'pages-hub-writer[bot]@users.noreply.github.com'], hub);
+    for (let attempt = 0; attempt < 5; attempt++) {
+      run('git', ['fetch', 'origin', 'main'], hub);
+      run('git', ['reset', '--hard', 'origin/main'], hub);
+      run(process.execPath, [path.join(source, 'website/scripts/sync-pages.mjs'), '--hub', hub]);
+      run('git', ['add', 'launcher', 'functions/launcher/download.js', '_routes.json', '_redirects'], hub);
+      const unchanged = quietRun('git', ['diff', '--cached', '--quiet'], {cwd: hub, log, allowedExitCodes: [0, 1]}) === 0;
+      if (unchanged) break;
+      run('git', ['commit', '-m', 'launcher: update website and latest stable installers'], hub);
+      try { run('git', ['push', 'origin', 'HEAD:main'], hub); break; }
+      catch { if (attempt === 4) throw new Error('Concurrent hub update did not converge.'); }
+    }
   } else throw new Error('Unknown bridge command.');
   console.log('Bridge step completed.');
 }

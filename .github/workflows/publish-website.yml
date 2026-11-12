@@ -1,0 +1,75 @@
+name: Publish launcher website to pages-hub
+on:
+  workflow_dispatch:
+    inputs:
+      source_sha:
+        description: Optional private source commit; leave empty to use latest main
+        type: string
+        default: ''
+  workflow_call:
+    inputs:
+      source_sha:
+        type: string
+        default: ''
+    secrets:
+      SOURCE_READ_TOKEN:
+        required: true
+      PAGES_HUB_APP_ID:
+        required: true
+      PAGES_HUB_APP_PRIVATE_KEY:
+        required: true
+permissions:
+  contents: read
+concurrency:
+  group: pages-hub-launcher
+  cancel-in-progress: false
+jobs:
+  publish:
+    if: github.repository == 'Voiid-Studios/launcher' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      SOURCE_SHA: ${{ inputs.source_sha }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: '24'
+          package-manager-cache: false
+      - name: Download website tooling privately
+        env:
+          SOURCE_READ_TOKEN: ${{ secrets.SOURCE_READ_TOKEN }}
+        run: node .github/scripts/bridge.mjs website-download
+      - name: Verify existing pages-hub App identity
+        id: app-config
+        env:
+          APP_ID: ${{ secrets.PAGES_HUB_APP_ID }}
+          APP_PRIVATE_KEY: ${{ secrets.PAGES_HUB_APP_PRIVATE_KEY }}
+        run: node .github/scripts/bridge.mjs website-key
+      - name: Test redirects and build the website privately
+        run: node .github/scripts/bridge.mjs website-build
+      - name: Generate short-lived pages-hub write token
+        id: app-token
+        uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2
+        with:
+          app-id: ${{ secrets.PAGES_HUB_APP_ID }}
+          private-key: ${{ steps.app-config.outputs.private-key }}
+          owner: Voiid-Studios
+          repositories: pages-hub
+          permission-contents: write
+      - name: Checkout only the website destination
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          repository: Voiid-Studios/pages-hub
+          ref: main
+          token: ${{ steps.app-token.outputs.token }}
+          path: pages-hub
+      - name: Publish current stable download redirects
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: node .github/scripts/bridge.mjs website-sync
+      - name: Remove temporary source and private logs
+        if: always()
+        run: node .github/scripts/bridge.mjs clean

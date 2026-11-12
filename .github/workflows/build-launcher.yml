@@ -40,7 +40,8 @@ jobs:
         env:
           SOURCE_READ_TOKEN: ${{ secrets.SOURCE_READ_TOKEN }}
           UPDATER_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
-          CALLBACK_TOKEN: ${{ secrets.BRIDGE_CALLBACK_TOKEN }}
+          APP_ID: ${{ secrets.PAGES_HUB_APP_ID }}
+          APP_PRIVATE_KEY: ${{ secrets.PAGES_HUB_APP_PRIVATE_KEY }}
           PUBLISH: ${{ inputs.publish }}
         run: node .github/scripts/bridge.mjs preflight
       - name: Validate approved source and release version
@@ -151,11 +152,14 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: node .github/scripts/bridge.mjs publish
-      - name: Refresh the download website using its private workflow
-        if: inputs.publish
-        env:
-          CALLBACK_TOKEN: ${{ secrets.BRIDGE_CALLBACK_TOKEN }}
-        run: node .github/scripts/bridge.mjs website
       - name: Remove temporary source and logs
         if: always()
         run: node .github/scripts/bridge.mjs clean
+  publish-website:
+    needs: release
+    if: inputs.publish && github.repository == 'Voiid-Studios/launcher' && github.ref == 'refs/heads/main'
+    uses: ./.github/workflows/publish-website.yml
+    secrets:
+      SOURCE_READ_TOKEN: ${{ secrets.SOURCE_READ_TOKEN }}
+      PAGES_HUB_APP_ID: ${{ secrets.PAGES_HUB_APP_ID }}
+      PAGES_HUB_APP_PRIVATE_KEY: ${{ secrets.PAGES_HUB_APP_PRIVATE_KEY }}
