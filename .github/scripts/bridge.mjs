@@ -72,7 +72,7 @@ async function main() {
   const log = path.join(root, 'private-build.log');
   const run = (command, args, cwd = source) => quietRun(command, args, {cwd, log});
   const version = () => {
-    const value = fs.readFileSync(path.join(desktop, 'VERSION'), 'utf8').trim();
+    const value = fs.readFileSync(path.join(source, 'VERSION'), 'utf8').trim();
     if (!versionPattern.test(value) || (process.env.RELEASE_TAG && process.env.RELEASE_TAG !== `v${value}`)) {
       throw new Error('Release tag and launcher version must match.');
     }
