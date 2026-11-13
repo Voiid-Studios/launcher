@@ -122,6 +122,9 @@ async function readVersion(source, desktop) {
   const buffer = fs.readFileSync(file);
   debug(`VERSION size: ${buffer.length} byte(s); first bytes (hex): ${buffer.subarray(0, 8).toString('hex') || '(none)'}`);
   const label = buffer.toString('utf8').trim();
+  if (process.argv[2] !== 'website-download' && label.toUpperCase().endsWith('INDEV')) {
+    throw new PublicError('INDEV versions are private and cannot be built or published on GitHub.');
+  }
   debug(`VERSION label: ${JSON.stringify(label.slice(0, 80))} (length ${label.length})`);
   let value;
   try {
@@ -193,8 +196,8 @@ async function main() {
     // A standalone website refresh resolves main once; subsequent downloads use that immutable SHA.
     const sha = command === 'website-download' && !process.env.SOURCE_SHA?.trim()
       ? (await (await api('commits/main', token)).json()).sha : process.env.SOURCE_SHA;
-    debug(`Source SHA: ${sha ?? '(unset)'}`);
     if (!/^[a-f0-9]{40}$/.test(sha ?? '')) throw new PublicError('An exact source commit is required (40 lowercase hexadecimal characters).');
+    debug(`Source SHA: ${sha}`);
     const comparison = await (await api(`compare/${sha}...main?per_page=1`, token)).json();
     debug(`Comparison status: ${comparison.status}; merge base matches SHA: ${comparison.merge_base_commit?.sha === sha}`);
     if (!approveComparison(comparison, sha)) throw new PublicError(`Source commit must belong to approved main history (comparison status: ${comparison.status}).`);
@@ -212,6 +215,10 @@ async function main() {
     debug(`Source root entries after extraction: ${listEntries(source)}`);
     publicStage = 'source-version';
     await version();
+    if (command === 'download' && process.env.GITHUB_OUTPUT) {
+      const label = fs.readFileSync(path.join(source, 'VERSION'), 'utf8').trim();
+      fs.appendFileSync(process.env.GITHUB_OUTPUT, `channel=${label.toUpperCase().endsWith('PTB') ? 'beta' : 'stable'}\n`);
+    }
   } else if (command === 'install') {
     publicStage = 'dependency-installation';
     debug(`Runner arch: ${process.arch}; expected: ${process.env.EXPECTED_ARCH}`);
@@ -222,6 +229,7 @@ async function main() {
     run('rustup', ['default', 'stable']);
   } else if (command === 'build') {
     publicStage = 'compilation-and-signing';
+    await version();
     const expected = process.platform === 'win32' ? 'windows-x64' : `macos-${process.arch}`;
     debug(`Runner platform: ${expected}; expected: ${process.env.EXPECTED_PLATFORM}`);
     if (process.env.EXPECTED_PLATFORM !== expected) throw new PublicError(`Runner platform mismatch (got ${expected}, expected ${process.env.EXPECTED_PLATFORM}).`);

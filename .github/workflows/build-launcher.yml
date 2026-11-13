@@ -4,15 +4,15 @@ on:
   workflow_dispatch:
     inputs:
       source_sha:
-        description: Exact approved source commit (40 hexadecimal characters)
+        description: 'Commit del repositorio privado integrado en main (SHA completo de 40 caracteres)'
         required: true
         type: string
       publish:
-        description: Publish the release and refresh the download website
+        description: 'Publicar según VERSION: PTB como prerelease; estable como latest. INDEV bloqueado'
         default: false
         type: boolean
       release_tag:
-        description: Optional tag; must match the launcher version
+        description: 'Tag opcional: debe coincidir con la versión interna del launcher (v...)'
         default: ''
         type: string
 permissions:
@@ -25,6 +25,8 @@ jobs:
     if: github.repository == 'Voiid-Studios/launcher' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     timeout-minutes: 5
+    outputs:
+      channel: ${{ steps.source.outputs.channel }}
     env:
       SOURCE_SHA: ${{ inputs.source_sha }}
       RELEASE_TAG: ${{ inputs.release_tag }}
@@ -45,6 +47,7 @@ jobs:
           PUBLISH: ${{ inputs.publish }}
         run: node .github/scripts/bridge.mjs preflight
       - name: Validate approved source and release version
+        id: source
         env:
           SOURCE_READ_TOKEN: ${{ secrets.SOURCE_READ_TOKEN }}
         run: node .github/scripts/bridge.mjs download
@@ -156,8 +159,8 @@ jobs:
         if: always()
         run: node .github/scripts/bridge.mjs clean
   publish-website:
-    needs: release
-    if: inputs.publish && github.repository == 'Voiid-Studios/launcher' && github.ref == 'refs/heads/main'
+    needs: [preflight, release]
+    if: inputs.publish && needs.preflight.outputs.channel == 'stable' && github.repository == 'Voiid-Studios/launcher' && github.ref == 'refs/heads/main'
     uses: ./.github/workflows/publish-website.yml
     secrets:
       SOURCE_READ_TOKEN: ${{ secrets.SOURCE_READ_TOKEN }}
