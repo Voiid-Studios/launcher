@@ -8,7 +8,7 @@ import {Readable} from 'node:stream';
 import {pipeline} from 'node:stream/promises';
 
 const repository = 'Voiid-Studios/voiid-launcher';
-const versionPattern = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/;
+const versionPattern = /^[0-9A-Za-z][0-9A-Za-z._-]{0,63}$/;
 let publicStage = 'initialization';
 
 export function archiveTool(platform = process.platform, systemRoot = process.env.SystemRoot) {
