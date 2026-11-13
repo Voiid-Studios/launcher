@@ -8,7 +8,8 @@ import {Readable} from 'node:stream';
 import {pipeline} from 'node:stream/promises';
 
 const repository = 'Voiid-Studios/voiid-launcher';
-const versionPattern = /^[0-9A-Za-z][0-9A-Za-z._-]{0,63}$/;
+// Internal (SemVer) version produced by desktop/scripts/version.mjs from the root VERSION label.
+const versionPattern = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-(?:0|[1-9]\d*|\d*[A-Za-z-][0-9A-Za-z-]*)(?:\.(?:0|[1-9]\d*|\d*[A-Za-z-][0-9A-Za-z-]*))*)?$/;
 // Set BRIDGE_DEBUG=false in the workflow env to silence the debug lines.
 const debugEnabled = process.env.BRIDGE_DEBUG !== 'false';
 let publicStage = 'initialization';
@@ -75,11 +76,20 @@ export function copyDistribution(input, output, files) {
 
 export function quietRun(command, args, {cwd, log, env = process.env, allowedExitCodes = [0]} = {}) {
   const descriptor = fs.openSync(log, 'a', 0o600);
+  const offset = fs.fstatSync(descriptor).size;
   try {
     const result = spawnSync(command, args, {cwd, env, stdio: ['ignore', descriptor, descriptor], windowsHide: true});
     if (result.error || !allowedExitCodes.includes(result.status)) {
       // Only the tool name and exit information are public; its output stays in the private log.
       debug(`Command "${path.basename(String(command))}" failed: status=${result.status}, signal=${result.signal ?? 'none'}, spawnErrorCode=${result.error?.code ?? 'none'}`);
+      // Opt-in only (BRIDGE_DEBUG_LOG=true): prints the tail of this command's output. It can contain
+      // private source excerpts or paths, so enable it only temporarily and disable it afterwards.
+      if (process.env.BRIDGE_DEBUG_LOG === 'true') {
+        const tail = fs.readFileSync(log, 'utf8').slice(offset).split(/\r?\n/).filter(Boolean).slice(-40);
+        console.log('[bridge:debug] ---- tail of failed command output (BRIDGE_DEBUG_LOG=true) ----');
+        for (const line of tail) console.log(`[bridge:debug] | ${line.slice(0, 300)}`);
+        console.log('[bridge:debug] ---- end of tail ----');
+      }
       throw new PublicError('Private build step failed. Output was not published.');
     }
     return result.status;
@@ -100,48 +110,36 @@ async function api(endpoint, token, options = {}) {
   return response;
 }
 
-// Reads and validates VERSION at the source root, printing public-safe diagnostics.
-function readVersion(source, desktop) {
+// Reads the root VERSION label, derives the internal version exactly like the build does
+// (desktop/scripts/version.mjs) and validates it. Prints public-safe diagnostics.
+async function readVersion(source, desktop) {
   const file = path.join(source, 'VERSION');
   debug('Looking for VERSION at <source>/VERSION');
   if (!fs.existsSync(file)) {
     debug(`VERSION not found at the source root. Source root entries: ${listEntries(source)}`);
-    debug(`<source>/desktop/VERSION exists: ${fs.existsSync(path.join(desktop, 'VERSION'))}`);
     throw new PublicError('VERSION file not found at the source root.');
-  }
-  const stat = fs.lstatSync(file);
-  if (!stat.isFile() || stat.isSymbolicLink()) {
-    debug(`VERSION is not a regular file: isFile=${stat.isFile()}, symlink=${stat.isSymbolicLink()}`);
-    throw new PublicError('VERSION must be a regular file.');
   }
   const buffer = fs.readFileSync(file);
   debug(`VERSION size: ${buffer.length} byte(s); first bytes (hex): ${buffer.subarray(0, 8).toString('hex') || '(none)'}`);
-  let text = buffer.toString('utf8');
-  if (text.charCodeAt(0) === 0xFEFF) {
-    debug('VERSION starts with a UTF-8 BOM; stripping it.');
-    text = text.slice(1);
+  const label = buffer.toString('utf8').trim();
+  debug(`VERSION label: ${JSON.stringify(label.slice(0, 80))} (length ${label.length})`);
+  let value;
+  try {
+    const {readVersion: internalVersion} = await import(pathToFileURL(path.join(desktop, 'scripts/version.mjs')).href);
+    value = internalVersion(desktop);
+  } catch (error) {
+    // version.mjs messages come from the private source; only the error type and code are public.
+    debug(`version.mjs failed: ${error?.name ?? 'unknown'} ${error?.code ?? ''}`.trim());
+    throw new PublicError('The internal version could not be derived from VERSION (desktop/scripts/version.mjs rejected it).');
   }
-  const value = text.trim();
-  debug(`Parsed VERSION: ${JSON.stringify(value.slice(0, 80))} (length ${value.length})`);
-  if (!value) throw new PublicError('VERSION file is empty.');
-  if (/[\r\n]/.test(value)) {
-    debug('VERSION contains more than one line.');
-    throw new PublicError('VERSION must contain a single line.');
-  }
-  if (!versionPattern.test(value)) {
-    const invalid = [...value.slice(0, 80)]
-      .map((char, index) => ({char, index}))
-      .filter(({char, index}) => !/[0-9A-Za-z._-]/.test(char) || (index === 0 && /[._-]/.test(char)))
-      .map(({char, index}) => `#${index}=U+${char.codePointAt(0).toString(16).toUpperCase().padStart(4, '0')}`);
-    debug(`Offending characters: ${invalid.join(', ') || 'none (check length, max 64)'}`);
-    throw new PublicError(`VERSION ${JSON.stringify(value.slice(0, 80))} does not match ${versionPattern}.`);
-  }
+  debug(`Internal version: ${JSON.stringify(value)}`);
+  if (!versionPattern.test(value)) throw new PublicError(`Internal version ${JSON.stringify(String(value).slice(0, 80))} is not valid SemVer.`);
   const tag = process.env.RELEASE_TAG;
   debug(`RELEASE_TAG: ${JSON.stringify(tag ?? '')}; expected when set: v${value}`);
   if (tag && tag !== `v${value}`) {
-    throw new PublicError(`release_tag ${JSON.stringify(tag)} does not match VERSION (expected v${value}).`);
+    throw new PublicError(`release_tag ${JSON.stringify(tag)} does not match the internal version (expected v${value}).`);
   }
-  debug(`VERSION accepted: ${value}`);
+  debug(`Version accepted: ${value}`);
   return value;
 }
 
@@ -155,7 +153,7 @@ async function main() {
   const source = path.join(root, 'source'), desktop = path.join(source, 'desktop');
   const log = path.join(root, 'private-build.log');
   const run = (command, args, cwd = source) => quietRun(command, args, {cwd, log});
-  const version = () => readVersion(source, desktop);
+  const version = async () => readVersion(source, desktop);
   const output = directory => fs.appendFileSync(process.env.GITHUB_OUTPUT, `path=${directory}\n`);
   const npm = (directory, ...args) => {
     const npmCli = process.platform === 'win32'
@@ -213,7 +211,7 @@ async function main() {
     fs.rmSync(archive);
     debug(`Source root entries after extraction: ${listEntries(source)}`);
     publicStage = 'source-version';
-    version();
+    await version();
   } else if (command === 'install') {
     publicStage = 'dependency-installation';
     debug(`Runner arch: ${process.arch}; expected: ${process.env.EXPECTED_ARCH}`);
@@ -254,12 +252,13 @@ async function main() {
     const input = path.join(desktop, 'release', ...(platform === 'windows-x64' ? [] : [platform]));
     const destination = path.join(root, 'distribution');
     debug(`Export platform: ${platform}; release directory entries: ${listEntries(input)}`);
-    copyDistribution(input, destination, distributionFiles(version(), platform));
+    copyDistribution(input, destination, distributionFiles(await version(), platform));
     output(destination);
   } else if (command === 'merge') {
     publicStage = 'manifest-merge';
     run(process.execPath, [path.join(desktop, 'scripts/merge-release.mjs')]);
-    const files = ['windows-x64', 'macos-x64', 'macos-arm64'].flatMap(platform => distributionFiles(version(), platform))
+    const releaseVersion = await version();
+    const files = ['windows-x64', 'macos-x64', 'macos-arm64'].flatMap(platform => distributionFiles(releaseVersion, platform))
       .filter(name => !name.endsWith('.sig'));
     const destination = path.join(root, 'distribution');
     debug(`Combined release directory entries: ${listEntries(path.join(desktop, 'release-combined'))}`);
@@ -267,7 +266,7 @@ async function main() {
     output(destination);
   } else if (command === 'publish') {
     publicStage = 'release-publication';
-    version();
+    await version();
     run(process.execPath, [path.join(desktop, 'scripts/publish-ci.mjs')]);
   } else if (command === 'website-key') {
     publicStage = 'website-app-configuration';
